@@ -94,37 +94,24 @@ class IndexOptionsAnalyzer:
                              options_chain: Dict[str, List[Dict]],
                              futures_data: Dict[str, Any],
                              vix: float) -> Dict[str, List[Dict]]:
-        """
-        Select optimal options based on Greeks and market conditions
-        
-        Args:
-            current_price: Current index price
-            options_chain: Complete options chain data
-            futures_data: Futures market data including volume
-            vix: Current VIX value
-            
-        Returns:
-            Dict containing selected call and put options
-        """
-        volatility = vix / 100  # Convert VIX to decimal
+        """Select optimal options with fallback to theoretical options"""
+        if not options_chain['calls'] and not options_chain['puts']:
+            # Generate theoretical options
+            theoretical_options = self._generate_theoretical_options(current_price, vix)
+            options_chain = theoretical_options
 
-        selected_options = {
-            'calls': [],
-            'puts': []
-        }
-
-        # Find ATM strike
+        # Select strikes around ATM
         atm_strike = self._find_atm_strike(current_price, options_chain)
-        
-        # Select strikes for analysis (ATM, ATM+1, ATM-1 for each type)
         strikes_to_analyze = {
             'calls': self._get_nearby_strikes(atm_strike, options_chain['calls'], 3),
             'puts': self._get_nearby_strikes(atm_strike, options_chain['puts'], 3)
         }
 
+        selected_options = {'calls': [], 'puts': []}
+        volatility = vix / 100
+
         for option_type in ['calls', 'puts']:
             for option in strikes_to_analyze[option_type]:
-                # Calculate Greeks
                 time_to_expiry = self._calculate_time_to_expiry(option['expiry'])
                 greeks = self.greeks_calculator.calculate_greeks(
                     current_price,
@@ -134,35 +121,74 @@ class IndexOptionsAnalyzer:
                     'call' if option_type == 'calls' else 'put'
                 )
 
-                # Calculate liquidity score and entry zones
                 enhanced_option = {
                     **option,
                     'greeks': greeks,
-                    'liquidity_score': self._calculate_liquidity_score(
-                        option,
-                        futures_data
-                    ),
-                    'entry_zones': self._calculate_entry_zones(
-                        option,
-                        greeks,
-                        current_price,
-                        vix
-                    )
+                    'liquidity_score': self._calculate_liquidity_score(option, futures_data),
+                    'entry_zones': self._calculate_entry_zones(option, greeks, current_price, vix)
                 }
-
                 selected_options[option_type].append(enhanced_option)
 
-            # Sort by optimal characteristics
-            selected_options[option_type] = sorted(
-                selected_options[option_type],
-                key=lambda x: (
-                    x['liquidity_score'],
-                    abs(0.5 - abs(x['greeks']['delta']))  # Prefer delta near 0.5
-                ),
-                reverse=True
-            )[:3]  # Keep top 3
-
         return selected_options
+
+    def _generate_theoretical_options(self, current_price: float, vix: float) -> Dict[str, List[Dict]]:
+        """Generate theoretical options around current price"""
+        strikes = []
+        base_strike = round(current_price / 50) * 50  # Round to nearest 50
+        
+        # Generate strikes ±5% around current price
+        for i in range(-5, 6):
+            strikes.append(base_strike + (i * 50))
+
+        theoretical_options = {'calls': [], 'puts': []}
+        expiry_dates = ['2025-02-01', '2025-02-07', '2025-02-14']  # Weekly expiries
+        
+        for strike in strikes:
+            for expiry in expiry_dates:
+                time_to_expiry = self._calculate_time_to_expiry(expiry)
+                volatility = vix / 100
+                
+                # Calculate theoretical price using Black-Scholes
+                call_price = self._calculate_theoretical_price(
+                    current_price, strike, time_to_expiry, volatility, 'call'
+                )
+                put_price = self._calculate_theoretical_price(
+                    current_price, strike, time_to_expiry, volatility, 'put'
+                )
+
+                # Add call option
+                theoretical_options['calls'].append({
+                    'strike_price': strike,
+                    'expiry': expiry,
+                    'ltp': call_price,
+                    'volume': futures_data.get('volume', 0) * 0.1,  # 10% of futures volume
+                    'openInterest': futures_data.get('oi', 0) * 0.1
+                })
+
+                # Add put option
+                theoretical_options['puts'].append({
+                    'strike_price': strike,
+                    'expiry': expiry,
+                    'ltp': put_price,
+                    'volume': futures_data.get('volume', 0) * 0.1,
+                    'openInterest': futures_data.get('oi', 0) * 0.1
+                })
+
+        return theoretical_options
+
+    def _calculate_theoretical_price(self,
+                                  spot: float,
+                                  strike: float,
+                                  time: float,
+                                  vol: float,
+                                  option_type: str) -> float:
+        """Calculate theoretical option price using Black-Scholes"""
+        greeks = self.greeks_calculator.calculate_greeks(spot, strike, time, vol, option_type)
+        if option_type == 'call':
+            return max(spot - strike, 0) + greeks['theta'] * time
+        else:
+            return max(strike - spot, 0) + greeks['theta'] * time
+        
 
     def _calculate_liquidity_score(self,
                                  option: Dict[str, Any],
@@ -319,79 +345,71 @@ class OptionsStrategyGenerator:
                                rsi: float,
                                vix: float,
                                optimal_options: Dict[str, List[Dict]]) -> Dict[str, Any]:
-        """Select primary options strategy based on market conditions"""
+        """Enhanced strategy selection with improved market condition handling"""
         try:
             strategies = []
             
-            # Safely get ATM options
+            # Get ATM options
             atm_call = optimal_options.get('calls', [{}])[0] if optimal_options.get('calls') else {}
             atm_put = optimal_options.get('puts', [{}])[0] if optimal_options.get('puts') else {}
             
-            # Bullish strategies
-            if trend == 'Bullish' and rsi < 70:
-                if vix > self.vix_threshold:
-                    strategies.append({
-                        'strategy_type': 'BULL_CALL_SPREAD',
-                        'primary_leg': atm_call,
-                        'secondary_leg': optimal_options.get('calls', [{}])[-1] if optimal_options.get('calls') else {},
-                        'rationale': 'High volatility bullish environment favors spreads',
-                        'confidence': 'high' if rsi > 40 else 'medium'
-                    })
-                else:
-                    strategies.append({
-                        'strategy_type': 'LONG_CALL',
-                        'primary_leg': atm_call,
-                        'rationale': 'Low volatility bullish trend supports direct call buying',
-                        'confidence': 'high' if rsi > 40 else 'medium'
-                    })
-            
-            # Bearish strategies
-            elif trend == 'Bearish' and rsi > 30:
+            # Strong Bearish Conditions
+            if trend == 'Bearish' and rsi < 30:
                 if vix > self.vix_threshold:
                     strategies.append({
                         'strategy_type': 'BEAR_PUT_SPREAD',
                         'primary_leg': atm_put,
                         'secondary_leg': optimal_options.get('puts', [{}])[-1] if optimal_options.get('puts') else {},
-                        'rationale': 'High volatility bearish environment favors spreads',
-                        'confidence': 'high' if rsi < 60 else 'medium'
+                        'rationale': 'Strong bearish trend with oversold RSI in high volatility',
+                        'confidence': 'high'
                     })
                 else:
                     strategies.append({
                         'strategy_type': 'LONG_PUT',
                         'primary_leg': atm_put,
-                        'rationale': 'Low volatility bearish trend supports direct put buying',
-                        'confidence': 'high' if rsi < 60 else 'medium'
+                        'rationale': 'Strong bearish trend with oversold RSI in low volatility',
+                        'confidence': 'high'
                     })
             
-            # Neutral strategies
-            else:
+            # Strong Bullish Conditions
+            elif trend == 'Bullish' and rsi > 70:
                 if vix > self.vix_threshold:
                     strategies.append({
-                        'strategy_type': 'IRON_CONDOR',
-                        'call_spread': {
-                            'long': optimal_options.get('calls', [{}])[-1],
-                            'short': atm_call
-                        },
-                        'put_spread': {
-                            'long': optimal_options.get('puts', [{}])[-1],
-                            'short': atm_put
-                        },
-                        'rationale': 'High volatility neutral market suits iron condor',
-                        'confidence': 'medium'
+                        'strategy_type': 'BULL_CALL_SPREAD',
+                        'primary_leg': atm_call,
+                        'secondary_leg': optimal_options.get('calls', [{}])[-1] if optimal_options.get('calls') else {},
+                        'rationale': 'Strong bullish trend with overbought RSI in high volatility',
+                        'confidence': 'high'
                     })
                 else:
                     strategies.append({
-                        'strategy_type': 'CALENDAR_SPREAD',
-                        'near_month': atm_call or atm_put,
-                        'rationale': 'Low volatility neutral market suits calendar spreads',
-                        'confidence': 'medium'
+                        'strategy_type': 'LONG_CALL',
+                        'primary_leg': atm_call,
+                        'rationale': 'Strong bullish trend with overbought RSI in low volatility',
+                        'confidence': 'high'
                     })
-
-            # Default strategy if no conditions met
-            if not strategies:
+            
+            # Neutral Conditions with Strong Volatility
+            elif vix > self.vix_threshold:
+                strategies.append({
+                    'strategy_type': 'IRON_CONDOR',
+                    'call_spread': {
+                        'long': optimal_options.get('calls', [{}])[-1],
+                        'short': atm_call
+                    },
+                    'put_spread': {
+                        'long': optimal_options.get('puts', [{}])[-1],
+                        'short': atm_put
+                    },
+                    'rationale': 'High volatility with neutral trend',
+                    'confidence': 'medium'
+                })
+            
+            # Default Wait Strategy
+            else:
                 strategies.append({
                     'strategy_type': 'WAIT',
-                    'rationale': 'Market conditions unclear',
+                    'rationale': 'Market conditions unclear or not favorable',
                     'confidence': 'low'
                 })
 
@@ -402,10 +420,10 @@ class OptionsStrategyGenerator:
             logger.error(f"Error selecting primary strategy: {e}")
             return {
                 'strategy_type': 'WAIT',
-                'rationale': 'Error in strategy selection',
+                'rationale': f'Error in strategy selection: {str(e)}',
                 'confidence': 'low'
             }
-
+        
     def _generate_hedge_strategy(self,
                                primary_strategy: Dict[str, Any],
                                optimal_options: Dict[str, List[Dict]],
@@ -437,28 +455,49 @@ class OptionsStrategyGenerator:
                                 optimal_options: Dict[str, List[Dict]],
                                 strategy_type: str,
                                 vix: float) -> Dict[str, Any]:
-        """Calculate appropriate position sizes based on strategy and volatility"""
-        # Reduce size in high volatility
-        volatility_factor = 1 - min((vix - self.vix_threshold) / 100, 0.5)
+        """Enhanced position sizing with volatility adjustment"""
+        try:
+            volatility_factor = max(0.5, 1 - ((vix - self.vix_threshold) / 100))
+            base_lots = 75  # Base lot size
+
+            position_sizes = {
+                'LONG_CALL': base_lots,
+                'LONG_PUT': base_lots,
+                'BULL_CALL_SPREAD': base_lots * 1.5,
+                'BEAR_PUT_SPREAD': base_lots * 1.5,
+                'IRON_CONDOR': base_lots * 0.75,
+                'CALENDAR_SPREAD': base_lots,
+                'WAIT': 0
+            }
+
+            lots = int(position_sizes.get(strategy_type, base_lots) * volatility_factor)
+
+            return {
+                'primary': f'{lots} lots',
+                'max_positions': 1 if strategy_type in ['IRON_CONDOR', 'CALENDAR_SPREAD'] else 2,
+                'scaling_rules': self._get_scaling_rules(strategy_type)
+            }
+        except Exception as e:
+            logger.error(f"Error calculating position sizes: {e}")
+            return {
+                'primary': '0 lots',
+                'max_positions': 0,
+                'scaling_rules': 'Error in calculation'
+            }
         
-        if strategy_type in ['LONG_CALL', 'LONG_PUT']:
-            return {
-                'primary': f'{int(100 * volatility_factor)} lots',
-                'max_positions': 1,
-                'scaling_rules': 'Scale in 2-3 parts on dips/rises'
-            }
-        elif strategy_type in ['BULL_CALL_SPREAD', 'BEAR_PUT_SPREAD']:
-            return {
-                'primary': f'{int(150 * volatility_factor)} lots',
-                'max_positions': 2,
-                'scaling_rules': 'Enter full spread position at once'
-            }
-        else:
-            return {
-                'primary': f'{int(75 * volatility_factor)} lots per leg',
-                'max_positions': 1,
-                'scaling_rules': 'Enter all legs simultaneously'
-            }
+
+    def _get_scaling_rules(self, strategy_type: str) -> str:
+        """Get specific scaling rules for each strategy type"""
+        rules = {
+            'LONG_CALL': 'Scale in 2-3 parts on dips',
+            'LONG_PUT': 'Scale in 2-3 parts on rallies',
+            'BULL_CALL_SPREAD': 'Enter full spread position at once',
+            'BEAR_PUT_SPREAD': 'Enter full spread position at once',
+            'IRON_CONDOR': 'Enter all legs simultaneously',
+            'CALENDAR_SPREAD': 'Enter full position at once',
+            'WAIT': 'No scaling needed'
+        }
+        return rules.get(strategy_type, 'Enter full position at once')
 
     def _generate_risk_parameters(self, vix: float) -> Dict[str, Any]:
         """Generate risk management parameters based on market conditions"""
